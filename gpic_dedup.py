@@ -40,6 +40,26 @@ REQUIRED_LIBS = {
     "imagehash": "imagehash",
 }
 
+# Optional but strongly recommended: decode Apple HEIC/HEIF photos.
+OPTIONAL_LIBS = {
+    "pillow_heif": "pillow-heif",
+}
+
+_HEIF_REGISTERED = None
+
+
+def maybe_register_heif() -> bool:
+    """Register the HEIF/HEIC opener with Pillow if the plugin is present."""
+    global _HEIF_REGISTERED
+    if _HEIF_REGISTERED is None:
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+            _HEIF_REGISTERED = True
+        except Exception:
+            _HEIF_REGISTERED = False
+    return _HEIF_REGISTERED
+
 
 # --------------------------------------------------------------------------- #
 # Step 1: OS detection and dependency checking
@@ -76,9 +96,15 @@ def check_dependencies(verbose: bool = True) -> list[str]:
     if verbose:
         print(f"Operating system : {detect_os()} ({platform.platform()})")
         print(f"Python           : {platform.python_version()} ({sys.executable})")
-        print("Library check:")
+        print("Library check (required):")
         for import_name, pip_name, status in rows:
-            print(f"  {import_name:<12} ({pip_name:<10}) : {status}")
+            print(f"  {import_name:<12} ({pip_name:<12}) : {status}")
+        print("Library check (optional):")
+        for import_name, pip_name in OPTIONAL_LIBS.items():
+            present = importlib.util.find_spec(import_name) is not None
+            note = "" if present else "  <- needed to read HEIC/HEIF (.heic) photos"
+            status = "OK" if present else "MISSING"
+            print(f"  {import_name:<12} ({pip_name:<12}) : {status}{note}")
 
     return missing
 
@@ -163,16 +189,17 @@ def find_sidecar(image_path: str) -> str:
 # Step 4: perceptual hashing
 # --------------------------------------------------------------------------- #
 def compute_phash_int(image_path: str):
-    """Return the pHash of an image as a 64-bit integer, or None on failure."""
+    """Return (phash_int, "") on success, or (None, reason) on failure."""
     from PIL import Image
     import imagehash
 
     try:
         with Image.open(image_path) as img:
+            img.load()
             h = imagehash.phash(img)
-    except Exception:
-        return None
-    return int(str(h), 16)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    return int(str(h), 16), ""
 
 
 # --------------------------------------------------------------------------- #
@@ -279,12 +306,22 @@ def scan_images(root: str) -> list[str]:
 
 
 def build_records(image_paths: list[str]) -> list:
+    from collections import Counter
+
+    maybe_register_heif()
     records: list = []
     total = len(image_paths)
+    skipped = 0
+    reason_by_type: Counter = Counter()
+    skipped_by_ext: Counter = Counter()
     for i, path in enumerate(image_paths, 1):
-        phash = compute_phash_int(path)
+        phash, reason = compute_phash_int(path)
         if phash is None:
-            print(f"  [skip] could not read: {path}")
+            skipped += 1
+            reason_by_type[reason.split(":", 1)[0]] += 1
+            skipped_by_ext[os.path.splitext(path)[1].lower()] += 1
+            if skipped <= 10:  # show a few concrete examples, then aggregate
+                print(f"  [skip] {reason} :: {path}")
             continue
         sidecar = find_sidecar(path)
         url = _read_url_from_json(sidecar) if sidecar else ""
@@ -292,7 +329,29 @@ def build_records(image_paths: list[str]) -> list:
                                     phash=phash, url=url))
         if i % 200 == 0 or i == total:
             print(f"  hashed {i}/{total}")
+    if skipped:
+        _report_skips(skipped, reason_by_type, skipped_by_ext)
     return records
+
+
+def _report_skips(skipped, reason_by_type, skipped_by_ext) -> None:
+    print(f"\n  Skipped {skipped} file(s) that could not be read.")
+    print("  By error type:")
+    for reason, count in reason_by_type.most_common():
+        print(f"    {count:>6}  {reason}")
+    print("  By file extension:")
+    for ext, count in skipped_by_ext.most_common():
+        print(f"    {count:>6}  {ext or '(no extension)'}")
+    heic = skipped_by_ext.get(".heic", 0) + skipped_by_ext.get(".heif", 0)
+    if heic:
+        print(f"\n  {heic} of the skipped files are HEIC/HEIF (Apple) images.")
+        if not maybe_register_heif():
+            print("  Pillow cannot decode HEIC/HEIF without a plugin. Install it and")
+            print("  re-run to include these photos:")
+            print(f"      {pip_install_command(['pillow-heif'])}")
+        else:
+            print("  The HEIC plugin is installed but these still failed -- the files")
+            print("  may be corrupt or truncated in the export.")
 
 
 def cluster_records(records: list, threshold: int) -> list:
@@ -345,6 +404,43 @@ def write_csv(clusters: list, output_path: str, only_duplicates: bool) -> int:
     return rows_written
 
 
+def safe_write_csv(clusters: list, output_path: str, only_duplicates: bool):
+    """Write the CSV, recovering interactively from permission/path errors.
+
+    Returns (rows_written, final_output_path). Never loses the computed
+    clusters: on failure the user can fix permissions and retry, or pick a
+    new path, without re-running the whole pipeline.
+    """
+    while True:
+        # A folder was given instead of a file: write a CSV inside it.
+        if os.path.isdir(output_path):
+            new_path = os.path.join(output_path, "duplicates.csv")
+            print(f"Output path is a folder; writing to: {new_path}")
+            output_path = new_path
+        try:
+            rows = write_csv(clusters, output_path, only_duplicates)
+            return rows, output_path
+        except (PermissionError, OSError) as exc:
+            print(f"\nCould not write the CSV to: {output_path}")
+            print(f"  Reason: {exc}")
+            print("This is almost always one of:")
+            print("  - The folder is read-only / your user lacks write permission.")
+            print("    On Windows: right-click the folder > Properties > Security >")
+            print("    Edit, select your user, tick 'Modify' and 'Write', then Apply.")
+            print("  - The CSV is currently open in another program (e.g. Excel). Close it.")
+            print("  - The path points to a protected location; pick another folder.")
+            print()
+            choice = input(
+                "Fix it, then press Enter to retry -- or type a new output path "
+                "(q to abort): "
+            ).strip().strip('"').strip("'")
+            if choice.lower() == "q":
+                print("Aborted: the CSV was not written (computed data was not saved).")
+                return 0, output_path
+            if choice:
+                output_path = choice
+
+
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
@@ -365,7 +461,7 @@ def run_pipeline(root: str, output_path: str, threshold: int,
     clusters = cluster_records(records, threshold)
     dup_groups = sum(1 for c in clusters if len(c.records) >= 2)
 
-    rows = write_csv(clusters, output_path, only_duplicates)
+    rows, output_path = safe_write_csv(clusters, output_path, only_duplicates)
 
     print("\nSummary")
     print(f"  images processed : {len(records)}")
@@ -540,4 +636,8 @@ def _selftest() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting.")
+        sys.exit(130)
