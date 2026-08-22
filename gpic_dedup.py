@@ -451,7 +451,7 @@ def run_pipeline(root: str, output_path: str, threshold: int,
     print(f"Found {len(image_paths)} image file(s).")
     if not image_paths:
         print("Nothing to do.")
-        return
+        return None
 
     print("\nComputing perceptual hashes and matching metadata...")
     records = build_records(image_paths)
@@ -469,75 +469,7 @@ def run_pipeline(root: str, output_path: str, threshold: int,
     print(f"  duplicate groups : {dup_groups}")
     print(f"  rows written     : {rows}")
     print(f"  output CSV       : {os.path.abspath(output_path)}")
-
-
-def prompt(text: str, default: str) -> str:
-    resp = input(f"{text} [{default}]: ").strip()
-    return resp or default
-
-
-def interactive_flow(args) -> None:
-    ensure_dependencies_or_exit()
-
-    root = args.root
-    while not root or not os.path.isdir(root):
-        root = input("Enter the path to your Takeout root folder: ").strip()
-        root = root.strip('"').strip("'")
-        if not os.path.isdir(root):
-            print(f"  Not a valid directory: {root!r}")
-
-    output_path = args.output or prompt("Output CSV path", "duplicates.csv")
-    threshold = args.threshold
-    if args.threshold is None:
-        threshold = int(prompt("Hamming distance threshold", "5"))
-    only_dupes = args.only_duplicates
-    if not args.only_duplicates:
-        only_dupes = prompt("Output only duplicate groups (y/n)", "n").lower().startswith("y")
-
-    run_pipeline(root, output_path, threshold, only_dupes)
-
-
-def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Cluster near-duplicate Google Photos (Takeout) by perceptual hash."
-    )
-    parser.add_argument("--root", help="Path to the Takeout root folder.")
-    parser.add_argument("--output", help="Output CSV path (default: duplicates.csv).")
-    parser.add_argument("--threshold", type=int,
-                        help="Hamming distance threshold (default: 5).")
-    parser.add_argument("--only-duplicates", action="store_true",
-                        help="Only write clusters that contain 2+ images.")
-    parser.add_argument("--check", action="store_true",
-                        help="Only run the OS/dependency check and exit.")
-    parser.add_argument("--selftest", action="store_true",
-                        help="Run a self-contained dry run on synthetic data.")
-    args = parser.parse_args(argv)
-
-    if args.check:
-        missing = check_dependencies(verbose=True)
-        if missing:
-            print("\nInstall the missing libraries with:")
-            print(f"    {pip_install_command(missing)}")
-            sys.exit(1)
-        print("\nAll required libraries are installed.")
-        return
-
-    if args.selftest:
-        ensure_dependencies_or_exit()
-        _selftest()
-        return
-
-    if args.root and os.path.isdir(args.root):
-        ensure_dependencies_or_exit()
-        run_pipeline(
-            args.root,
-            args.output or "duplicates.csv",
-            args.threshold if args.threshold is not None else 5,
-            args.only_duplicates,
-        )
-        return
-
-    interactive_flow(args)
+    return output_path
 
 
 # --------------------------------------------------------------------------- #
@@ -633,11 +565,3 @@ def _selftest() -> None:
     print(f"(Temp data left at: {tmp})")
     if not ok:
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Exiting.")
-        sys.exit(130)
